@@ -1,27 +1,22 @@
+.env
+
 # Python
 __pycache__/
 *.pyc
-
 # Virtual environment
 venv/
-
 # Data files
 data/raw/
-
 # OS files
 .DS_Store
-
 # VS Code
 .vscode/
 # macOS
 .DS_Store
-
 # Python
 __pycache__/
 *.pyc
-
 # Virtual environment
 venv/
-
 # Raw data
 data/raw/
