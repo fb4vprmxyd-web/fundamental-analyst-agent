@@ -1,22 +1,37 @@
+# Environment variables
 .env
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+
 # Virtual environment
 venv/
+env/
+ENV/
+
 # Data files
 data/raw/
+data/cache/
+
+# Reports
+reports/
+
 # OS files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
 # VS Code
 .vscode/
-# macOS
-.DS_Store
-# Python
-__pycache__/
-*.pyc
-# Virtual environment
-venv/
-# Raw data
-data/raw/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
