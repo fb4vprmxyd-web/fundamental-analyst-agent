@@ -34,4 +34,8 @@ reports/
 .ipynb_checkpoints/
 
 # pytest
+
 .pytest_cache/
+data/cache/market_data_cache.csv
+data/cache/peer_multiples_cache.csv
+
