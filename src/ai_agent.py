@@ -80,10 +80,11 @@ BLENDED RECOMMENDATION:
 
 Please provide:
 1. **Executive Summary** - One paragraph overview with clear BUY/HOLD/SELL recommendation
-2. **Valuation Analysis** - Discuss the DCF and multiples approaches, highlighting key insights
+2. **Valuation Analysis** - Discuss the DCF and multiples approaches, highlighting key insights, concisely describe the rationale behind any outliers.
 3. **Key Risks** - What could make this analysis wrong?
 4. **Investment Thesis** - The core argument for or against investing
 5. **Price Target** - Your recommended target price with reasoning
+
 
 Be specific, professional, and data-driven. Use the numbers provided to support your analysis."""
 

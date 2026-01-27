@@ -7,6 +7,7 @@ import yfinance as yf
 import os
 import requests
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
@@ -113,17 +114,18 @@ def save_peer_multiples_cache(df):
         print(f"Warning: Could not save peer cache: {e}")
 
 
-def safe_yfinance_call(func, max_retries=3, delay=5):
-    """Retry yfinance calls with exponential backoff to handle rate limits."""
+def safe_yfinance_call(func, max_retries=2, initial_delay=15):
+    """Retry yfinance calls with exponential backoff - REDUCED retries to avoid rate limits."""
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as e:
             if attempt < max_retries - 1:
-                wait_time = delay * (2 ** attempt)
-                print(f"Yahoo Finance rate limit hit. Waiting {wait_time} seconds...")
+                wait_time = initial_delay * (2 ** attempt)  # 15s, 30s
+                print(f"⏳ Yahoo Finance error. Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
             else:
+                print(f"❌ Yahoo Finance failed after {max_retries} attempts: {e}")
                 raise e
 
 
@@ -145,31 +147,35 @@ def fetch_market_data_alpha_vantage(ticker_symbol):
     # Fetch current price from GLOBAL_QUOTE
     try:
         quote_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker_symbol}&apikey={api_key}"
-        response = requests.get(quote_url)
+        response = requests.get(quote_url, timeout=10)
         data = response.json()
 
         if "Global Quote" in data and "05. price" in data["Global Quote"]:
             result['currentPrice'] = float(data["Global Quote"]["05. price"])
+            print(f"  ✓ Price from Alpha Vantage: ${result['currentPrice']:.2f}")
     except Exception as e:
-        print(f"Alpha Vantage GLOBAL_QUOTE failed: {e}")
+        print(f"  ✗ Alpha Vantage GLOBAL_QUOTE failed: {e}")
 
     time.sleep(12)  # Rate limit: 5 calls per minute for free tier
 
     # Fetch beta and shares from OVERVIEW
     try:
         overview_url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker_symbol}&apikey={api_key}"
-        response = requests.get(overview_url)
+        response = requests.get(overview_url, timeout=10)
         data = response.json()
 
         if "Beta" in data and data["Beta"] != "None":
             result['beta'] = float(data["Beta"])
+            print(f"  ✓ Beta from Alpha Vantage: {result['beta']:.2f}")
         else:
             result['beta'] = 1.0  # Default beta
+            print(f"  ⚠️  Using default beta: 1.0")
 
         if "SharesOutstanding" in data and data["SharesOutstanding"] != "None":
             result['sharesOutstanding'] = float(data["SharesOutstanding"])
+            print(f"  ✓ Shares from Alpha Vantage: {result['sharesOutstanding']:,.0f}")
     except Exception as e:
-        print(f"Alpha Vantage OVERVIEW failed: {e}")
+        print(f"  ✗ Alpha Vantage OVERVIEW failed: {e}")
 
     return result
 
@@ -330,71 +336,169 @@ class FundamentalAnalyzer:
         cagr = (fcf_end / fcf_start) ** (1 / years) - 1
         return float(cagr)
     
+    def risk_free_rate_from_fred(self):
+        """
+        Fetch from FRED (Federal Reserve Economic Data) - Most reliable
+        Using DGS10 (10-Year Treasury Constant Maturity Rate)
+        """
+        try:
+            url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                last_line = lines[-1]
+                date, rate = last_line.split(',')
+                
+                if rate and rate != '.' and rate != 'NA':
+                    rate_decimal = float(rate) / 100
+                    print(f"  ✓ FRED: {rate_decimal:.4f} ({rate}%) as of {date}")
+                    return rate_decimal
+        except Exception as e:
+            print(f"  ✗ FRED failed: {e}")
+        raise ValueError("Could not fetch rate from FRED")
+    
+    def risk_free_rate_from_treasury_gov(self):
+        """Fetch from Treasury.gov - Official source"""
+        try:
+            url = "https://www.treasury.gov/resource-center/data-chart-center/interest-rates/Pages/TextView.aspx?data=yield"
+            headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+            
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                table = soup.find('table', {'class': 't-chart'})
+                
+                if table:
+                    rows = table.find_all('tr')
+                    if len(rows) > 1:
+                        latest_row = rows[1]
+                        cells = latest_row.find_all('td')
+                        
+                        if len(cells) > 8:
+                            rate_text = cells[8].text.strip()
+                            if rate_text and rate_text != 'N/A':
+                                rate_decimal = float(rate_text) / 100
+                                print(f"  ✓ Treasury.gov: {rate_decimal:.4f} ({rate_text}%)")
+                                return rate_decimal
+        except Exception as e:
+            print(f"  ✗ Treasury.gov failed: {e}")
+        raise ValueError("Could not fetch rate from Treasury.gov")
+    
+    def risk_free_rate_from_marketwatch(self):
+        """Fetch from MarketWatch"""
+        try:
+            url = "https://www.marketwatch.com/investing/bond/tmubmusd10y?countrycode=bx"
+            headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                price_element = soup.find('bg-quote', {'class': 'value'})
+                
+                if price_element:
+                    rate_text = price_element.text.strip()
+                    rate_decimal = float(rate_text) / 100
+                    print(f"  ✓ MarketWatch: {rate_decimal:.4f} ({rate_text}%)")
+                    return rate_decimal
+        except Exception as e:
+            print(f"  ✗ MarketWatch failed: {e}")
+        raise ValueError("Could not fetch rate from MarketWatch")
+    
     def risk_free_rate_alpha_vantage(self):
         """Fetch 10-year US Treasury yield from Alpha Vantage."""
-        import requests
-        import os
-        from dotenv import load_dotenv
-        
-        load_dotenv()
         api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
         
         if not api_key:
             raise ValueError("ALPHA_VANTAGE_API_KEY not found in .env file")
         
         url = f"https://www.alphavantage.co/query?function=TREASURY_YIELD&interval=monthly&maturity=10year&apikey={api_key}"
-        
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         
         if "data" in data and len(data["data"]) > 0:
-            # Get the most recent yield (already in percentage, convert to decimal)
             latest_yield = float(data["data"][0]["value"]) / 100
+            print(f"  ✓ Alpha Vantage: {latest_yield:.4f} ({data['data'][0]['value']}%)")
             return latest_yield
-        else:
-            raise ValueError("Could not fetch Treasury rate from Alpha Vantage")
+        
+        raise ValueError("Could not fetch Treasury rate from Alpha Vantage")
     
     def risk_free_rate_yfinance(self):
-        """Fallback: Fetch 10-year US Treasury yield from Yahoo Finance (^TNX)."""
-        def fetch_rate():
+        """Fallback: Fetch from yfinance - SINGLE ATTEMPT ONLY"""
+        try:
             tnx = yf.Ticker("^TNX")
-            hist = tnx.history(period="10d")
+            hist = tnx.history(period="5d")
             
-            if hist.empty:
-                raise ValueError("Could not fetch ^TNX data from Yahoo Finance")
-            
-            x = float(hist["Close"].dropna().iloc[-1])
-            
-            if x > 20:
-                return x / 1000
-            elif x > 1:
-                return x / 100
-            else:
-                return x
+            if not hist.empty and 'Close' in hist.columns:
+                close_values = hist["Close"].dropna()
+                if not close_values.empty:
+                    x = float(close_values.iloc[-1])
+                    
+                    # Convert to decimal format
+                    if x > 20:
+                        rate_decimal = x / 1000
+                    elif x > 1:
+                        rate_decimal = x / 100
+                    else:
+                        rate_decimal = x
+                    
+                    print(f"  ✓ yfinance: {rate_decimal:.4f} ({x})")
+                    return rate_decimal
+        except Exception as e:
+            print(f"  ✗ yfinance failed: {e}")
         
-        return safe_yfinance_call(fetch_rate)
+        raise ValueError("Could not fetch ^TNX data from Yahoo Finance")
     
     def risk_free_rate(self):
-        """Get risk-free rate from cache or fetch fresh. Falls back to default if APIs fail."""
+        """
+        Get risk-free rate from cache or fetch from multiple sources.
+        NO DEFAULT FALLBACK - will raise error if all sources fail.
+        """
+        # Use cache if available
         if self.market_data_cache and self.market_data_cache.get('riskFreeRate'):
             return self.market_data_cache['riskFreeRate']
-
-        # Try Alpha Vantage first
-        try:
-            return self.risk_free_rate_alpha_vantage()
-        except Exception as e:
-            print(f"Alpha Vantage Treasury fetch failed ({e}), trying yfinance...")
-
-        # Try yfinance
-        try:
-            return self.risk_free_rate_yfinance()
-        except Exception as e:
-            print(f"yfinance Treasury fetch failed ({e}), using default rate...")
-
-        # Default to a reasonable 10-year Treasury rate
-        default_rate = 0.0425  # ~4.25% as of 2024
-        print(f"Using default risk-free rate: {default_rate:.2%}")
-        return default_rate
+        
+        print("\n" + "="*70)
+        print("FETCHING 10-YEAR US TREASURY RATE")
+        print("="*70)
+        
+        # Try sources in order of reliability
+        sources = [
+            ("FRED", self.risk_free_rate_from_fred),
+            ("Alpha Vantage", self.risk_free_rate_alpha_vantage),
+            ("Treasury.gov", self.risk_free_rate_from_treasury_gov),
+            ("MarketWatch", self.risk_free_rate_from_marketwatch),
+            ("yfinance", self.risk_free_rate_yfinance),
+        ]
+        
+        errors = []
+        for source_name, fetch_func in sources:
+            try:
+                rate = fetch_func()
+                if rate and 0.01 <= rate <= 0.20:  # Sanity check: between 1% and 20%
+                    print(f"\n✓ Successfully fetched from {source_name}: {rate*100:.2f}%")
+                    print("="*70 + "\n")
+                    return rate
+            except Exception as e:
+                errors.append(f"{source_name}: {str(e)}")
+                time.sleep(1)  # Brief pause between attempts
+        
+        # If we get here, all sources failed - raise error with helpful message
+        error_msg = "\n" + "="*70 + "\n"
+        error_msg += "❌ ERROR: Could not fetch 10-year Treasury rate from ANY source!\n"
+        error_msg += "="*70 + "\n\n"
+        error_msg += "Attempted sources:\n"
+        for error in errors:
+            error_msg += f"  • {error}\n"
+        error_msg += "\nPlease check:\n"
+        error_msg += "  1. Your internet connection\n"
+        error_msg += "  2. That you're not behind a firewall blocking financial data\n"
+        error_msg += "  3. Your Alpha Vantage API key (if using that service)\n"
+        error_msg += "  4. Wait a few minutes and try again (APIs may be rate limiting)\n"
+        error_msg += "\n" + "="*70
+        
+        print(error_msg)
+        raise ValueError("All Treasury rate sources failed. Cannot proceed without risk-free rate.")
 
     def equity_risk_premium(self, default_erp=0.055):
         """Equity Risk Premium (market assumption, e.g., 5.5%)."""
@@ -600,7 +704,9 @@ class FundamentalAnalyzer:
 
     def update_market_data_cache(self):
         """Fetch fresh market data and update cache using Alpha Vantage (primary) or yfinance (fallback)."""
-        print("Fetching fresh market data from Alpha Vantage...")
+        print("\n" + "="*70)
+        print("FETCHING MARKET DATA")
+        print("="*70)
 
         try:
             av_data = fetch_market_data_alpha_vantage(self.ticker_symbol)
@@ -612,12 +718,24 @@ class FundamentalAnalyzer:
             if current_price is None or shares_outstanding is None:
                 raise ValueError("Alpha Vantage returned incomplete data")
 
+            print(f"✓ Alpha Vantage fetch successful")
+
         except Exception as e:
-            print(f"Alpha Vantage failed ({e}), falling back to yfinance...")
+            print(f"⚠️  Alpha Vantage failed ({e})")
+            print(f"Falling back to yfinance...")
+            
             current_price = safe_yfinance_call(lambda: self.ticker.info.get("currentPrice", None))
             beta = safe_yfinance_call(lambda: self.ticker.info.get("beta", 1.0))
             shares_outstanding = safe_yfinance_call(lambda: self.ticker.info.get("sharesOutstanding", None))
+            
+            if current_price and beta and shares_outstanding:
+                print(f"  ✓ Price: ${current_price:.2f}")
+                print(f"  ✓ Beta: {beta:.2f}")
+                print(f"  ✓ Shares: {shares_outstanding:,.0f}")
+            else:
+                raise ValueError("Failed to fetch required market data from both Alpha Vantage and yfinance")
 
+        # Fetch risk-free rate (will use cache if available, or fetch from multiple sources)
         risk_free_rate = self.risk_free_rate()
 
         save_market_data_cache(
@@ -634,11 +752,13 @@ class FundamentalAnalyzer:
             'riskFreeRate': risk_free_rate,
             'sharesOutstanding': shares_outstanding,
         }
+        
+        print("="*70)
 
     def dcf_valuation(
         self,
         forecast_years=5,
-        terminal_growth=0.04,  # ← Changed from 0.025 (2.5%) to 0.04 (4%)
+        terminal_growth=0.04,
         cap_forecast_growth=0.20,
         default_erp=0.055,
     ):
@@ -678,12 +798,26 @@ class FundamentalAnalyzer:
         net_debt = self.net_debt_latest()
         equity_value = enterprise_value - net_debt
         
-        if self.market_data_cache and 'sharesOutstanding' in self.market_data_cache:
+        # Get shares from cache with validation
+        if self.market_data_cache and self.market_data_cache.get('sharesOutstanding'):
             shares = self.market_data_cache['sharesOutstanding']
         else:
+            print("⚠️  WARNING: Shares outstanding not in cache, attempting yfinance fetch...")
             shares = safe_yfinance_call(lambda: self.ticker.info.get("sharesOutstanding", None))
         
-        intrinsic_price = equity_value / shares if shares else None
+        # Calculate intrinsic price (with None check)
+        if shares and shares > 0:
+            intrinsic_price = equity_value / shares
+        else:
+            print("❌ ERROR: Invalid shares outstanding, cannot calculate intrinsic price")
+            intrinsic_price = None
+        
+        # Get current price from cache
+        current_price = None
+        if self.market_data_cache and self.market_data_cache.get('currentPrice'):
+            current_price = self.market_data_cache['currentPrice']
+        else:
+            print("⚠️  WARNING: Current price not in cache")
         
         return {
             "fcff_base": fcff_0,
@@ -695,12 +829,12 @@ class FundamentalAnalyzer:
             "equity_value": equity_value,
             "shares_outstanding": shares,
             "intrinsic_price": intrinsic_price,
-            "current_price": (self.market_data_cache.get('currentPrice') if self.market_data_cache else None) or safe_yfinance_call(lambda: self.ticker.info.get("currentPrice", None)),
+            "current_price": current_price,
         }
     
     def dcf_terminal_growth_sensitivity(
         self,
-        terminal_growth_rates=(0.03, 0.04, 0.05),  # Changed default to 3%, 4%, 5%
+        terminal_growth_rates=(0.03, 0.04, 0.05),
         forecast_years=5,
         cap_forecast_growth=0.20,
         default_erp=0.055,
@@ -731,7 +865,7 @@ class FundamentalAnalyzer:
 
         try:
             url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={self.ticker_symbol}&apikey={api_key}"
-            response = requests.get(url)
+            response = requests.get(url, timeout=10)
             data = response.json()
 
             return {
@@ -773,7 +907,7 @@ class FundamentalAnalyzer:
             try:
                 # Use Alpha Vantage OVERVIEW for peer data
                 url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={peer}&apikey={api_key}"
-                response = requests.get(url)
+                response = requests.get(url, timeout=10)
                 data = response.json()
 
                 peer_entry = {
@@ -834,19 +968,19 @@ class FundamentalAnalyzer:
         # Implied prices
         implied_prices = {}
         
-        if "P/E" in peer_medians:
+        if "P/E" in peer_medians and shares > 0:
             eps = net_income / shares
             implied_prices["P/E"] = peer_medians["P/E"] * eps
         
-        if "P/B" in peer_medians:
+        if "P/B" in peer_medians and shares > 0:
             book_per_share = book_value / shares
             implied_prices["P/B"] = peer_medians["P/B"] * book_per_share
         
-        if "P/S" in peer_medians:
+        if "P/S" in peer_medians and shares > 0:
             sales_per_share = revenue / shares
             implied_prices["P/S"] = peer_medians["P/S"] * sales_per_share
         
-        if "EV/EBITDA" in peer_medians:
+        if "EV/EBITDA" in peer_medians and shares > 0:
             implied_ev = peer_medians["EV/EBITDA"] * ebitda
             implied_equity = implied_ev - self.net_debt_latest()
             implied_prices["EV/EBITDA"] = implied_equity / shares
@@ -857,12 +991,33 @@ class FundamentalAnalyzer:
         else:
             current_price = safe_yfinance_call(lambda: self.ticker.info.get("currentPrice", None))
         
+        # Calculate average implied price (only if we have valid prices)
+        # Filter out outliers: exclude prices that deviate >50% from current price
+        average_implied_price = None
+        if implied_prices and current_price:
+            valid_prices = []
+            filtered_out = []
+            for ratio, price in implied_prices.items():
+                if price and price > 0:
+                    # Calculate percentage deviation from current price
+                    deviation = abs(price - current_price) / current_price
+                    if deviation <= 0.5:  # Accept if deviation is 50% or less
+                        valid_prices.append(price)
+                    else:
+                        filtered_out.append(f"{ratio}: ${price:.2f} ({deviation*100:.1f}% deviation)")
+            
+            if filtered_out:
+                print(f"  ⚠️  Filtered outliers (>50% deviation): {', '.join(filtered_out)}")
+            
+            if valid_prices:
+                average_implied_price = np.mean(valid_prices)
+        
         return {
             "current_price": current_price,
             "current_multiples": current_multiples,
             "peer_median_multiples": peer_medians,
             "implied_prices": implied_prices,
-            "average_implied_price": np.mean(list(implied_prices.values())) if implied_prices else None,
+            "average_implied_price": average_implied_price,
         }
 
 
@@ -874,13 +1029,14 @@ if __name__ == "__main__":
         analyzer.market_data_cache is not None
         and analyzer.market_data_cache.get('currentPrice') is not None
         and analyzer.market_data_cache.get('sharesOutstanding') is not None
+        and analyzer.market_data_cache.get('riskFreeRate') is not None
     )
 
     if not cache_valid:
         print("Cache is missing or incomplete. Refreshing market data...")
         analyzer.update_market_data_cache()
 
-    print("="*70)
+    print("\n" + "="*70)
     print("DCF VALUATION")
     print("="*70)
 
@@ -895,13 +1051,21 @@ if __name__ == "__main__":
             dcf_upside = ((dcf_result['intrinsic_price'] - dcf_result['current_price']) / dcf_result['current_price']) * 100
             print(f"DCF Upside:                    {dcf_upside:+.2f}%")
         else:
-            print("\nError: Could not calculate DCF intrinsic price (missing shares outstanding)")
+            print("\n❌ ERROR: Could not calculate DCF intrinsic price")
+            print("This likely means shares outstanding data is unavailable.")
             print(f"Forecast Growth (CAGR):        {dcf_result['forecast_growth']:.2%}")
             print(f"WACC:                          {dcf_result['wacc']:.2%}")
+    except ValueError as e:
+        print(f"\n❌ DCF Valuation failed: {e}")
+        print("\nThe valuation cannot proceed without a valid risk-free rate.")
+        print("Please resolve the data fetching issues above and try again.")
+        exit(1)
     except Exception as e:
-        print(f"\nDCF Valuation failed: {e}")
-        print("\nThis is likely due to Yahoo Finance rate limiting.")
-        print("Please wait 10-15 minutes and try again.")
+        print(f"\n❌ DCF Valuation failed: {e}")
+        print("\nThis could be due to:")
+        print("  • Yahoo Finance rate limiting")
+        print("  • Missing or incomplete financial data")
+        print("  • Network connectivity issues")
         exit(1)
     
     print("\n" + "="*70)
@@ -911,52 +1075,58 @@ if __name__ == "__main__":
     try:
         multiples = analyzer.multiples_valuation()
         
-        print(f"\nCurrent Multiples (AAPL):")
-        for k, v in multiples['current_multiples'].items():
-            if v:
-                print(f"  {k}: {v:.2f}")
-        
-        print(f"\nPeer Median Multiples:")
-        for k, v in multiples['peer_median_multiples'].items():
-            print(f"  {k}: {v:.2f}")
-        
-        print(f"\nImplied Prices by Multiple:")
-        for k, v in multiples['implied_prices'].items():
-            print(f"  {k}: ${v:.2f}")
-        
-        print(f"\nMultiples Average Price:       ${multiples['average_implied_price']:.2f}")
-        multiples_upside = ((multiples['average_implied_price'] - multiples['current_price']) / multiples['current_price']) * 100
-        print(f"Multiples Upside:              {multiples_upside:+.2f}%")
-        
-        print("\n" + "="*70)
-        print("BLENDED RECOMMENDATION (60% DCF / 40% Multiples)")
-        print("="*70)
-        
-        blended = dcf_result['intrinsic_price'] * 0.6 + multiples['average_implied_price'] * 0.4
-        blended_upside = ((blended - dcf_result['current_price']) / dcf_result['current_price']) * 100
-        
-        print(f"\nDCF Target (60%):              ${dcf_result['intrinsic_price']:.2f}")
-        print(f"Multiples Target (40%):        ${multiples['average_implied_price']:.2f}")
-        print(f"Blended Target Price:          ${blended:.2f}")
-        print(f"Current Price:                 ${dcf_result['current_price']:.2f}")
-        print(f"Blended Upside:                {blended_upside:+.2f}%")
-        
-        if blended_upside > 20:
-            rec = "BUY"
-            confidence = "High" if blended_upside > 30 else "Medium"
-        elif blended_upside < -15:
-            rec = "SELL"
-            confidence = "High" if blended_upside < -25 else "Medium"
+        if not multiples['average_implied_price']:
+            print("\n⚠️  WARNING: Could not calculate multiples valuation")
+            print("Proceeding with DCF only...")
         else:
-            rec = "HOLD"
-            confidence = "Medium"
-        
-        print(f"\n{'='*70}")
-        print(f"FINAL RECOMMENDATION: {rec} ({confidence} Confidence)")
-        print(f"{'='*70}")
+            print(f"\nCurrent Multiples (AAPL):")
+            for k, v in multiples['current_multiples'].items():
+                if v:
+                    print(f"  {k}: {v:.2f}")
+            
+            print(f"\nPeer Median Multiples:")
+            for k, v in multiples['peer_median_multiples'].items():
+                print(f"  {k}: {v:.2f}")
+            
+            print(f"\nImplied Prices by Multiple:")
+            for k, v in multiples['implied_prices'].items():
+                print(f"  {k}: ${v:.2f}")
+            
+            print(f"\nMultiples Average Price:       ${multiples['average_implied_price']:.2f}")
+            multiples_upside = ((multiples['average_implied_price'] - multiples['current_price']) / multiples['current_price']) * 100
+            print(f"Multiples Upside:              {multiples_upside:+.2f}%")
+            
+            print("\n" + "="*70)
+            print("BLENDED RECOMMENDATION (60% DCF / 40% Multiples)")
+            print("="*70)
+            
+            if dcf_result['intrinsic_price'] and multiples['average_implied_price']:
+                blended = dcf_result['intrinsic_price'] * 0.6 + multiples['average_implied_price'] * 0.4
+                blended_upside = ((blended - dcf_result['current_price']) / dcf_result['current_price']) * 100
+                
+                print(f"\nDCF Target (60%):              ${dcf_result['intrinsic_price']:.2f}")
+                print(f"Multiples Target (40%):        ${multiples['average_implied_price']:.2f}")
+                print(f"Blended Target Price:          ${blended:.2f}")
+                print(f"Current Price:                 ${dcf_result['current_price']:.2f}")
+                print(f"Blended Upside:                {blended_upside:+.2f}%")
+                
+                if blended_upside > 20:
+                    rec = "BUY"
+                    confidence = "High" if blended_upside > 30 else "Medium"
+                elif blended_upside < -15:
+                    rec = "SELL"
+                    confidence = "High" if blended_upside < -25 else "Medium"
+                else:
+                    rec = "HOLD"
+                    confidence = "Medium"
+                
+                print(f"\n{'='*70}")
+                print(f"FINAL RECOMMENDATION: {rec} ({confidence} Confidence)")
+                print(f"{'='*70}")
+            else:
+                print("\n⚠️  Blended valuation unavailable - using DCF only")
 
         print("\n" + "="*70)
-        
         print("TERMINAL GROWTH SENSITIVITY (3%, 4%, 5%)")
         print("="*70)
 
@@ -968,9 +1138,12 @@ if __name__ == "__main__":
             tg = row['terminal_growth']
             price = row['intrinsic_price']
             current = row['current_price']
-            upside = ((price - current) / current) * 100 if current else 0
-            print(f"{tg:>18.1%}  ${price:>12.2f}  {upside:>12.2f}%")
+            if price and current:
+                upside = ((price - current) / current) * 100
+                print(f"{tg:>18.1%}  ${price:>12.2f}  {upside:>12.2f}%")
+            else:
+                print(f"{tg:>18.1%}  N/A")
         
     except Exception as e:
-        print(f"\nMultiples Valuation failed: {e}")
-        print("This is likely due to Yahoo Finance rate limiting.")
+        print(f"\n❌ Multiples Valuation failed: {e}")
+        print("Proceeding with DCF valuation only...")
